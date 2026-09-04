@@ -50,10 +50,23 @@ NAVIMOW_DIR = _resolve_navimow_dir()
 
 
 def _install_ha_stubs() -> None:
-    if "homeassistant.helpers.update_coordinator" in sys.modules:
-        return
+    """Force our lightweight stand-ins into sys.modules for the specific
+    homeassistant.* leaf modules coordinator.py/config_flow.py import.
 
-    ha = types.ModuleType("homeassistant")
+    This always overwrites those entries, even if a *real* homeassistant
+    install already imported them for real (e.g. inside an actual Home
+    Assistant container, some other pytest plugin may import the real
+    homeassistant.helpers.update_coordinator before this conftest runs).
+    The real DataUpdateCoordinator enforces internal invariants (a running
+    HA "frame helper"/config entry context) that our minimal FakeHass in
+    these tests can't satisfy and doesn't need to - we only want to
+    exercise our own coordinator/config_flow logic in isolation, not
+    Home Assistant's own machinery.
+
+    We deliberately do NOT touch "homeassistant" or "homeassistant.helpers"
+    themselves if they already exist for real, so anything else relying on
+    the genuine package elsewhere in the same process is left alone.
+    """
     ha_helpers = types.ModuleType("homeassistant.helpers")
     ha_update_coordinator = types.ModuleType("homeassistant.helpers.update_coordinator")
     ha_exceptions = types.ModuleType("homeassistant.exceptions")
@@ -134,8 +147,17 @@ def _install_ha_stubs() -> None:
     ha_helpers_network.get_url = get_url
     ha_helpers_aiohttp_client.async_get_clientsession = async_get_clientsession
 
-    sys.modules["homeassistant"] = ha
-    sys.modules["homeassistant.helpers"] = ha_helpers
+    # Only create bare top-level package placeholders if nothing (real or
+    # otherwise) is already registered there - these two are never imported
+    # from directly by our code, they just need to exist so Python doesn't
+    # complain about a fully-dotted import having no parent at all in an
+    # environment with no real homeassistant installed at all.
+    sys.modules.setdefault("homeassistant", types.ModuleType("homeassistant"))
+    sys.modules.setdefault("homeassistant.helpers", ha_helpers)
+
+    # These specific leaves are always overwritten with our stand-ins,
+    # regardless of whether a real homeassistant install already loaded
+    # its own (much stricter) versions elsewhere in this process.
     sys.modules["homeassistant.helpers.update_coordinator"] = ha_update_coordinator
     sys.modules["homeassistant.exceptions"] = ha_exceptions
     sys.modules["homeassistant.config_entries"] = ha_config_entries
