@@ -11,6 +11,10 @@
       "auth": {
         "title": "Link Navimow Account",
         "description": "Please click [this link]({auth_url}) to log into your Segway Navimow account.\n\nOnce completed, this window will close or update automatically."
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Navimow",
+        "description": "Your Navimow session has expired. Click Submit to log in again."
       }
     },
     "error": {

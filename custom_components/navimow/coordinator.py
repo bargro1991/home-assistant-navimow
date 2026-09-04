@@ -1,4 +1,5 @@
 """DataUpdateCoordinator for Segway Navimow integration."""
+import asyncio
 from datetime import timedelta
 import logging
 import json
@@ -7,6 +8,7 @@ import uuid
 from urllib.parse import urlparse
 import paho.mqtt.client as mqtt
 
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from .const import DOMAIN
 
@@ -21,10 +23,21 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.devices = devices
         self._mqtt_client = None
-        self._pending_mqtt_token = None
         self._mqtt_info = None
-        self._token_expires_at = 0  # Timestamp when access token expires
-        
+        # A single lock shared by every code path that can trigger a token
+        # refresh (the periodic poll, the reactive 401 handler and the MQTT
+        # on_disconnect handler). Without this, two of those paths could
+        # refresh concurrently with the *same* refresh_token; if the auth
+        # server rotates refresh tokens (single use), one of the two calls
+        # is then rejected with "invalid refresh token" even though the
+        # account itself is fine.
+        self._token_lock = asyncio.Lock()
+        # Seed from the absolute expiry timestamp we persisted last time we
+        # got a token, so a HA restart doesn't blindly assume the token is
+        # brand new (which used to force a redundant refresh on every
+        # restart) nor blindly assume it's still valid.
+        self._token_expires_at = entry.data.get("expires_at", 0)
+
         super().__init__(
             hass,
             _LOGGER,
@@ -32,95 +45,144 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=30),
         )
 
-    async def _async_ensure_valid_token(self) -> None:
-        """Refresh OAuth token only if expired or expiring soon.
-        
-        Checks token expiration timestamp before refreshing to avoid unnecessary
-        API calls. Maintains 10-second buffer before actual expiration.
+    async def _async_ensure_valid_token(self, force: bool = False) -> bool:
+        """Refresh the OAuth token if it is expired or expiring soon.
+
+        Returns True if a valid access token is available afterwards, False
+        if the refresh failed outright (e.g. the refresh token itself was
+        rejected by the server).
+
+        Guarded by `_token_lock` so concurrent callers (periodic poll,
+        reactive 401 handling, MQTT disconnect handler) never race each
+        other with the same refresh_token. The expiry check is repeated
+        after acquiring the lock in case another caller already refreshed
+        while we were waiting for it.
         """
-        # Check if token is still valid (with 10s buffer)
-        now = time.time()
-        if now < self._token_expires_at - 10:
-            return  # Token still valid, no need to refresh
-        
-        refresh_token = self.entry.data.get("refresh_token")
-        if not refresh_token:
+        async with self._token_lock:
+            now = time.time()
+            if not force and now < self._token_expires_at - 10:
+                return True  # Token still valid, no need to refresh
+
+            refresh_token = self.entry.data.get("refresh_token")
+            if not refresh_token:
+                return False
+
+            try:
+                token_response = await self.api.async_refresh_token(refresh_token)
+            except Exception as err:
+                _LOGGER.warning("Failed to refresh OAuth token: %s", err)
+                return False
+
+            if not token_response or "access_token" not in token_response:
+                _LOGGER.warning("Refresh token rejected by server: %s", token_response)
+                return False
+
+            new_access = token_response["access_token"]
+            new_refresh = token_response.get("refresh_token", refresh_token)
+
+            # Calculate and persist the *absolute* expiry timestamp (not just
+            # the relative expires_in) so it survives a HA restart.
+            expires_in = token_response.get("expires_in", 3600)  # Default 1 hour if not provided
+            self._token_expires_at = now + expires_in
+
+            self.api._token = new_access
+
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={
+                    **self.entry.data,
+                    "access_token": new_access,
+                    "refresh_token": new_refresh,
+                    "expires_at": self._token_expires_at,
+                },
+            )
+            _LOGGER.debug("OAuth token refreshed (expires in %ds)", expires_in)
+
+            # Keep any already-open MQTT connection in sync with the new
+            # access token right away, instead of waiting for it to
+            # disconnect on its own (which previously never actually
+            # happened - the old code stored the new token in
+            # `_pending_mqtt_token` but never read it back).
+            await self._async_update_mqtt_auth(new_access)
+
+            return True
+
+    async def _async_update_mqtt_auth(self, new_access_token: str) -> None:
+        """Push a refreshed access token into an already-running MQTT client."""
+        if not self._mqtt_client or not self._mqtt_info:
             return
-        
-        try:
-            token_response = await self.api.async_refresh_token(refresh_token)
-            if token_response and "access_token" in token_response:
-                new_access = token_response["access_token"]
-                new_refresh = token_response.get("refresh_token", refresh_token)
-                
-                # Calculate token expiration time
-                expires_in = token_response.get("expires_in", 3600)  # Default 1 hour if not provided
-                self._token_expires_at = now + expires_in
-                
-                self.api._token = new_access
-                
-                self.hass.config_entries.async_update_entry(
-                    self.entry,
-                    data={
-                        **self.entry.data,
-                        "access_token": new_access,
-                        "refresh_token": new_refresh,
-                    },
-                )
-                _LOGGER.debug("OAuth token refreshed (expires in %ds)", expires_in)
-        except Exception as err:
-            _LOGGER.warning("Failed to refresh OAuth token: %s", err)
+
+        mqtt_info = self._mqtt_info
+
+        def _update_auth():
+            try:
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+
+                auth_headers = {"Authorization": f"Bearer {new_access_token}"}
+                ws_path = mqtt_info.get("mqttUrl", "/mqtt")
+                self._mqtt_client.ws_set_options(path=ws_path, headers=auth_headers)
+
+                mqtt_host = mqtt_info.get("mqttHost", "")
+                parsed = urlparse(mqtt_host)
+                hostname = parsed.hostname or mqtt_host
+
+                _LOGGER.info("Reconnecting MQTT with refreshed access token")
+                self._mqtt_client.connect(hostname, 443, 60)
+                self._mqtt_client.loop_start()
+            except Exception as err:
+                _LOGGER.error("Failed to update MQTT auth header: %s", err)
+
+        await self.hass.async_add_executor_job(_update_auth)
+
+    async def _async_apply_new_mqtt_info(self, mqtt_info: dict) -> None:
+        """Apply freshly fetched MQTT broker credentials to a running client."""
+        self._mqtt_info = mqtt_info
+        new_username = mqtt_info.get("userName")
+        new_password = mqtt_info.get("pwdInfo")
+
+        if not (new_username and new_password and self._mqtt_client):
+            return
+
+        _LOGGER.info("MQTT credentials refreshed after disconnect, updating client credentials")
+
+        def _update_credentials():
+            try:
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+
+                self._mqtt_client.username_pw_set(new_username, new_password)
+
+                token = self.entry.data.get("access_token")
+                auth_headers = {"Authorization": f"Bearer {token}"}
+                ws_path = mqtt_info.get("mqttUrl", "/mqtt")
+                self._mqtt_client.ws_set_options(path=ws_path, headers=auth_headers)
+
+                mqtt_host = mqtt_info.get("mqttHost", "")
+                parsed = urlparse(mqtt_host)
+                hostname = parsed.hostname or mqtt_host
+
+                _LOGGER.info("Reconnecting MQTT with new credentials")
+                self._mqtt_client.connect(hostname, 443, 60)
+                self._mqtt_client.loop_start()
+            except Exception as err:
+                _LOGGER.error("Failed to update MQTT client credentials: %s", err)
+
+        await self.hass.async_add_executor_job(_update_credentials)
 
     async def _async_refresh_mqtt_credentials_on_disconnect(self) -> None:
         """Refresh MQTT credentials after disconnection.
-        
+
         When MQTT disconnects, it's often because the OAuth token expired.
         We need to refresh the token first, then fetch fresh MQTT credentials.
+        Shares `_async_ensure_valid_token`'s lock, so this never races the
+        periodic/reactive HTTP token refresh.
         """
         try:
-            # First ensure we have a fresh OAuth token
             await self._async_ensure_valid_token()
-            
-            # Then fetch fresh MQTT credentials with the new token
             new_mqtt_info = await self.api.async_get_mqtt_info()
             if new_mqtt_info:
-                new_username = new_mqtt_info.get("userName")
-                new_password = new_mqtt_info.get("pwdInfo")
-                
-                if new_username and new_password and self._mqtt_client:
-                    _LOGGER.info("MQTT credentials refreshed after disconnect, updating client credentials")
-                    
-                    # Update MQTT client with new credentials
-                    def _update_credentials():
-                        try:
-                            # Stop the loop and disconnect
-                            self._mqtt_client.loop_stop()
-                            self._mqtt_client.disconnect()
-                            
-                            # Update credentials
-                            self._mqtt_client.username_pw_set(new_username, new_password)
-                            
-                            # Update auth headers with fresh token
-                            token = self.entry.data.get("access_token")
-                            auth_headers = {"Authorization": f"Bearer {token}"}
-                            ws_path = new_mqtt_info.get("mqttUrl", "/mqtt")
-                            self._mqtt_client.ws_set_options(path=ws_path, headers=auth_headers)
-                            
-                            # Reconnect
-                            mqtt_host = new_mqtt_info.get("mqttHost", "")
-                            parsed = urlparse(mqtt_host)
-                            hostname = parsed.hostname or mqtt_host
-                            port = 443
-                            
-                            _LOGGER.info("Reconnecting MQTT with new credentials")
-                            self._mqtt_client.connect(hostname, port, 60)
-                            self._mqtt_client.loop_start()
-                        except Exception as err:
-                            _LOGGER.error("Failed to update MQTT client credentials: %s", err)
-                    
-                    await self.hass.async_add_executor_job(_update_credentials)
-                    # Store updated mqtt_info
-                    self._mqtt_info = new_mqtt_info
+                await self._async_apply_new_mqtt_info(new_mqtt_info)
         except Exception as err:
             _LOGGER.warning("Failed to refresh MQTT credentials on disconnect: %s", err)
 
@@ -133,9 +195,9 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_ensure_valid_token()
         except Exception as err:
             _LOGGER.warning("Token refresh failed during update: %s", err)
-        
+
         device_ids = [d["id"] for d in self.devices]
-        
+
         if not device_ids:
             _LOGGER.debug("No devices found for this account")
             return {}
@@ -144,42 +206,28 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
 
         if isinstance(data, dict) and data.get("error") == "TOKEN_EXPIRED":
             _LOGGER.info("Access token expired, attempting refresh...")
-            
-            refresh_token = self.entry.data.get("refresh_token")
-            if not refresh_token:
-                raise UpdateFailed("Refresh token missing, reconnect the Navimow account")
 
-            token_response = await self.api.async_refresh_token(refresh_token)
-            
-            if token_response and "access_token" in token_response:
-                new_access = token_response["access_token"]
-                new_refresh = token_response.get("refresh_token", refresh_token)
-                
+            # Goes through the same locked path as the proactive refresh
+            # above and the MQTT disconnect handler, so this can never use
+            # a refresh_token that one of those already consumed/rotated.
+            # `force=True` because the server just told us the current
+            # access token is invalid, regardless of our local expiry timer.
+            refreshed = await self._async_ensure_valid_token(force=True)
+
+            if refreshed:
                 _LOGGER.info("New access token obtained successfully")
-
-                self.api._token = new_access
-                
-                self.hass.config_entries.async_update_entry(
-                    self.entry,
-                    data={
-                        **self.entry.data,
-                        "access_token": new_access,
-                        "refresh_token": new_refresh,
-                    },
-                )
-                # Update MQTT WebSocket auth headers to avoid reconnection failures (CODE_OAUTH_INFO_ILLEGAL)
-                # Store new token for MQTT credential refresh on disconnect
-                self._pending_mqtt_token = new_access
-
                 data = await self.api.async_get_all_vehicles_status(device_ids)
             else:
                 _LOGGER.error("Refresh token is invalid or server rejected the request")
-                raise UpdateFailed("Session expired. Please remove and re-add the integration.")
+                # ConfigEntryAuthFailed (not UpdateFailed) tells Home Assistant
+                # this is an auth problem, so it offers a native "Reauthenticate"
+                # flow instead of leaving the user to remove and re-add the
+                # integration by hand.
+                raise ConfigEntryAuthFailed("Session expired, please reauthenticate")
 
         if data is None:
             raise UpdateFailed("Communication error with Navimow servers")
 
-        
         return data
 
     async def async_setup_mqtt(self, mqtt_info):
@@ -259,7 +307,13 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
                 # After MQTT disconnection, refresh credentials from server.
                 # MQTT credentials (userName/pwdInfo) are bound to the OAuth token.
                 # If token expired, causing the disconnection, we need to fetch fresh credentials.
-                self.hass.create_task(self._async_refresh_mqtt_credentials_on_disconnect())
+                #
+                # This callback runs on paho-mqtt's own background thread
+                # (started via loop_start()), NOT on the HA event loop thread.
+                # hass.create_task() is only safe to call from the event loop
+                # thread; hass.add_job() is the thread-safe way to schedule a
+                # coroutine from here (same as on_message does above).
+                self.hass.add_job(self._async_refresh_mqtt_credentials_on_disconnect)
 
             client.on_message = on_message
             client.on_connect = on_connect
