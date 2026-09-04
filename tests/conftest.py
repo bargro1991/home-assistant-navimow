@@ -14,8 +14,39 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-NAVIMOW_DIR = REPO_ROOT / "custom_components" / "navimow"
+
+def _resolve_navimow_dir() -> Path:
+    """Locate the navimow integration directory (where coordinator.py and
+    config_flow.py actually live), regardless of how these test files were
+    placed. Two layouts are supported:
+
+    Layout A - dropped straight into custom_components/navimow, right next
+    to coordinator.py (e.g. testing in-place inside a live Home Assistant
+    config directory: /config/custom_components/navimow/).
+
+    Layout B - kept in a separate tests/ directory next to
+    custom_components/navimow/ (the layout used during development of this
+    integration).
+    """
+    conftest_dir = Path(__file__).resolve().parent
+
+    if (conftest_dir / "coordinator.py").exists():
+        return conftest_dir
+
+    candidate = conftest_dir.parent / "custom_components" / "navimow"
+    if (candidate / "coordinator.py").exists():
+        return candidate
+
+    raise RuntimeError(
+        "Could not find the navimow integration directory: no coordinator.py "
+        f"next to {conftest_dir} and none under {candidate}. Run these tests "
+        "either from inside custom_components/navimow itself, or from a "
+        "tests/ directory placed next to a custom_components/navimow/ "
+        "directory."
+    )
+
+
+NAVIMOW_DIR = _resolve_navimow_dir()
 
 
 def _install_ha_stubs() -> None:
