@@ -11,6 +11,17 @@
       "auth": {
         "title": "Link Navimow Account",
         "description": "Per favore, clicca su [questo link]({auth_url}) per effettuare il login con il tuo account Segway Navimow.\n\nUna volta terminato, la finestra si chiuderà da sola o si aggiornerà automaticamente."
+      },
+      "reauth_confirm": {
+        "title": "Riautenticazione Navimow",
+        "description": "La tua sessione Navimow è scaduta. Clicca su Invia per effettuare nuovamente il login."
+      },
+      "url_confirm": {
+        "title": "Conferma URL di callback",
+        "description": "Home Assistant ha rilevato `{detected_url}` come indirizzo a cui Segway dovrebbe reindirizzare dopo il login. Questo deve essere un indirizzo raggiungibile dal tuo **browser** (su laptop o telefono) - non un indirizzo interno del container/Docker. Correggilo se necessario, es. `http://192.168.1.10:8123` oppure il tuo URL pubblico `https://`.",
+        "data": {
+          "base_url": "URL base"
+        }
       }
     },
     "error": {

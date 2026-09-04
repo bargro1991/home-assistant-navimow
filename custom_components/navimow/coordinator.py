@@ -259,8 +259,18 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
             username = mqtt_info.get("userName", "unknown")
             rand_suffix = uuid.uuid4().hex[:10]
             client_id = f"web_{username}_{rand_suffix}"
-            
-            client = mqtt.Client(client_id=client_id, transport="websockets")
+
+            # Home Assistant core's own "mqtt" integration already pins
+            # paho-mqtt>=2.1.0 on modern installs, which uses a new
+            # constructor/callback signature (CallbackAPIVersion.VERSION2).
+            # Explicitly requesting it here (rather than relying on the
+            # deprecated implicit VERSION1 default) keeps this working
+            # regardless of what other integrations already pulled in.
+            client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id=client_id,
+                transport="websockets",
+            )
             
             password = mqtt_info.get("pwdInfo")
             client.username_pw_set(username, password)
@@ -285,8 +295,12 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as e:
                     _LOGGER.error("Error parsing MQTT: %s", e)
 
-            def on_connect(client, userdata, flags, rc):
-                if rc == 0:
+            # CallbackAPIVersion.VERSION2 signatures: on_connect gets
+            # (client, userdata, connect_flags, reason_code, properties)
+            # instead of the old (client, userdata, flags, rc).
+            # `reason_code` compares equal to 0 for success, same as the old `rc`.
+            def on_connect(client, userdata, connect_flags, reason_code, properties=None):
+                if reason_code == 0:
                     _LOGGER.info("MQTT connected successfully")
                     for device in self.devices:
                         device_id = device.get("id")
@@ -300,10 +314,10 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
                                 client.subscribe(topic)
                                 _LOGGER.debug("Subscribed to topic: %s", topic)
                 else:
-                    _LOGGER.error("MQTT connection error (rc=%d)", rc)
+                    _LOGGER.error("MQTT connection error (reason_code=%s)", reason_code)
 
-            def on_disconnect(client, userdata, rc):
-                _LOGGER.info("MQTT disconnected: rc=%d", rc)
+            def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
+                _LOGGER.info("MQTT disconnected: reason_code=%s", reason_code)
                 # After MQTT disconnection, refresh credentials from server.
                 # MQTT credentials (userName/pwdInfo) are bound to the OAuth token.
                 # If token expired, causing the disconnection, we need to fetch fresh credentials.

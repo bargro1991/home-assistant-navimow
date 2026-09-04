@@ -16,6 +16,18 @@ from .const import DOMAIN, CLIENT_ID, CLIENT_SECRET, TOKEN_URL, AUTH_BASE_URL
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_reachable_base_url(url: str) -> bool:
+    """Basic sanity check for a URL a browser should be able to open.
+
+    This can't know whether the URL is *actually* reachable from the
+    person's laptop/phone (that would need a real network probe from the
+    browser side), but it catches the obvious mistakes: missing scheme,
+    missing host, or pasting something that clearly isn't a URL at all.
+    """
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
 class NavimowCallbackView(HomeAssistantView):
     """HTTP endpoint in Home Assistant to handle Navimow OAuth redirect."""
     
@@ -73,7 +85,7 @@ class NavimowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(self.account_name)
             self._abort_if_unique_id_configured()
 
-            return await self.async_step_auth()
+            return await self.async_step_url_confirm()
 
         data_schema = vol.Schema({
             vol.Required("account_name", default="My Navimow"): str
@@ -102,21 +114,57 @@ class NavimowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Ask the user to confirm before re-launching the OAuth login."""
         if user_input is None:
             return self.async_show_form(step_id="reauth_confirm")
-        return await self.async_step_auth()
+        return await self.async_step_url_confirm()
+
+    async def async_step_url_confirm(self, user_input=None):
+        """Let the user confirm or correct the base URL used for the OAuth redirect.
+
+        get_url(prefer_external=True) falls back to whatever internal URL
+        Home Assistant knows about when no external URL is configured in
+        Settings > System > Network. In a Docker/container setup that can be
+        a container-internal hostname or IP that the browser on a laptop or
+        phone can never reach - the person only discovers this after Segway
+        redirects them nowhere. Showing the detected value and letting them
+        edit it fixes this without requiring them to configure HA's network
+        settings first.
+        """
+        errors = {}
+
+        if user_input is not None:
+            base_url = user_input["base_url"].strip().rstrip("/")
+            if not _is_reachable_base_url(base_url):
+                errors["base_url"] = "invalid_url"
+            else:
+                self.redirect_uri = f"{base_url}/api/navimow/callback"
+                return await self.async_step_auth()
+
+        try:
+            detected_url = get_url(self.hass, prefer_external=True)
+        except Exception:
+            detected_url = get_url(self.hass)
+
+        data_schema = vol.Schema({
+            vol.Required("base_url", default=detected_url): str
+        })
+
+        return self.async_show_form(
+            step_id="url_confirm",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={"detected_url": detected_url},
+        )
 
     async def async_step_auth(self, user_input=None):
         """Second step: Show OAuth login link and wait for callback."""
-        
+
         if user_input is not None and "code" in user_input:
             return await self.async_step_exchange(user_input["code"])
 
-        try:
-            ha_url = get_url(self.hass, prefer_external=True)
-        except Exception:
-            ha_url = get_url(self.hass)
+        if not self.redirect_uri:
+            # Defensive fallback in case this step is ever entered directly
+            # without going through async_step_url_confirm first.
+            return await self.async_step_url_confirm()
 
-        self.redirect_uri = f"{ha_url}/api/navimow/callback"
-        
         params = {
             "channel": "homeassistant",
             "client_id": CLIENT_ID,

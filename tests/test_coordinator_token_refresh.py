@@ -222,9 +222,32 @@ async def test_mqtt_disconnect_schedules_via_thread_safe_add_job(
 
     client = captured["client"]
     # Fire the disconnect callback exactly as paho-mqtt's background thread
-    # would (i.e. NOT from the asyncio event loop thread).
-    client.on_disconnect(client, None, 1)
+    # would (i.e. NOT from the asyncio event loop thread). CallbackAPIVersion.
+    # VERSION2 passes (client, userdata, disconnect_flags, reason_code, properties).
+    client.on_disconnect(client, None, {}, 1, None)
 
     assert len(hass.jobs) == 1
     scheduled_target, _ = hass.jobs[0]
     assert scheduled_target == coord._async_refresh_mqtt_credentials_on_disconnect
+
+
+async def test_mqtt_client_requests_callback_api_version2(make_coordinator, coordinator_module, monkeypatch):
+    """Home Assistant core's own `mqtt` integration now requires
+    paho-mqtt>=2.1.0, which needs callback_api_version passed explicitly
+    or Client() behaves unpredictably across versions. Guards against
+    silently reverting to the old implicit-VERSION1 call."""
+    coord, hass, entry = make_coordinator()
+
+    captured_kwargs = {}
+
+    def spy_client(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(coordinator_module.mqtt, "Client", spy_client)
+    coord._connect_mqtt({"mqttHost": "wss://broker.example.com", "userName": "u", "pwdInfo": "p"})
+
+    assert (
+        captured_kwargs.get("callback_api_version")
+        == coordinator_module.mqtt.CallbackAPIVersion.VERSION2
+    )
